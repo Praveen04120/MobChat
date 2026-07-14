@@ -1,0 +1,28 @@
+{
+  "rules": {
+    "users": {
+      "$uid": {
+        ".read": "$uid === auth.uid",
+        ".write": "$uid === auth.uid"
+      }
+    },
+    "rooms": {
+      "$roomCode": {
+        ".read": "auth !== null",
+        ".write": "auth !== null && (!data.exists() || (data.child('creatorId').val() === auth.uid && newData.child('status').val() === 'deleted'))",
+        "members": {
+          "$uid": {
+            ".read": "auth !== null",
+            ".write": "$uid === auth.uid"
+          }
+        },
+        "messages": {
+          ".read": "auth !== null",
+          "$messageId": {
+            ".write": "auth !== null && !data.exists() && newData.child('senderId').val() === auth.uid"
+          }
+        }
+      }
+    }
+  }
+}
