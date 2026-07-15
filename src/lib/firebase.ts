@@ -1,6 +1,6 @@
 import { initializeApp, getApps } from "firebase/app";
 import { getAuth, signInAnonymously, onAuthStateChanged, User } from "firebase/auth";
-import { getDatabase, ref, set, get, onValue, push, serverTimestamp, update, onDisconnect } from "firebase/database";
+import { getDatabase, ref, set, get, onValue, push, serverTimestamp, update, onDisconnect, runTransaction } from "firebase/database";
 
 const firebaseConfig = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -17,5 +17,5 @@ const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0
 const auth = getAuth(app);
 const db = getDatabase(app);
 
-export { app, auth, db, signInAnonymously, onAuthStateChanged, ref, set, get, onValue, push, serverTimestamp, update, onDisconnect };
+export { app, auth, db, signInAnonymously, onAuthStateChanged, ref, set, get, onValue, push, serverTimestamp, update, onDisconnect, runTransaction };
 export type { User };

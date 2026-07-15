@@ -16,6 +16,12 @@
             ".write": "$uid === auth.uid"
           }
         },
+        "memberNames": {
+          "$safeName": {
+            ".read": "auth !== null",
+            ".write": "auth !== null && (newData.val() === auth.uid || (data.val() === auth.uid && !newData.exists()))"
+          }
+        },
         "messages": {
           ".read": "auth !== null",
           "$messageId": {

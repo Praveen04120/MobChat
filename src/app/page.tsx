@@ -1,23 +1,20 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { ArrowLeft, Copy, Send, Trash2, Check, Loader2 } from "lucide-react";
+import { ArrowLeft, Copy, Trash2, Check, Loader2 } from "lucide-react";
 import { 
   auth, db, signInAnonymously, onAuthStateChanged, 
-  ref, set, get, onValue, push, serverTimestamp, update, 
+  ref, set, get, onValue, push, serverTimestamp, update, runTransaction,
   User 
 } from "@/lib/firebase";
 import { Unsubscribe } from "firebase/database";
+import { Message } from "@/components/chat/types";
+import { MessageList } from "@/components/chat/MessageList";
+import { Composer } from "@/components/chat/Composer";
+import { SelectionActionBar } from "@/components/chat/SelectionActionBar";
+import { normalizeName, createFirebaseSafeNameKey } from "@/lib/utils";
 
 type Screen = "loading" | "welcome" | "action" | "join" | "creating" | "chat";
-
-interface Message {
-  id: string;
-  senderId: string;
-  senderName: string;
-  text: string;
-  createdAt: number;
-}
 
 export default function Home() {
   const [screen, setScreen] = useState<Screen>("loading");
@@ -41,20 +38,19 @@ export default function Home() {
   const [copied, setCopied] = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [copyFeedback, setCopyFeedback] = useState(false);
   
   // Chat state
   const [messages, setMessages] = useState<Message[]>([]);
   const [newMessage, setNewMessage] = useState("");
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  
+  // Advanced Chat State
+  const [selectedMessageIds, setSelectedMessageIds] = useState<Set<string>>(new Set());
+  const [replyTarget, setReplyTarget] = useState<Message | null>(null);
 
   // Subscriptions refs to clean up
   const roomStatusUnsub = useRef<Unsubscribe | null>(null);
   const messagesUnsub = useRef<Unsubscribe | null>(null);
-
-  // Auto-scroll chat
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
 
   // Auth and initial profile load
   useEffect(() => {
@@ -126,6 +122,44 @@ export default function Home() {
     }
   };
 
+  const reserveNameAndJoin = async (code: string) => {
+    if (!user) throw new Error("Not authenticated");
+    
+    const normName = normalizeName(name);
+    const safeKey = createFirebaseSafeNameKey(normName);
+    const nameRef = ref(db, `rooms/${code}/memberNames/${safeKey}`);
+    
+    // Transaction to reserve the name
+    const result = await runTransaction(nameRef, (currentData) => {
+      if (currentData === null) {
+        return user.uid; // Reserve it
+      }
+      if (currentData === user.uid) {
+        return user.uid; // Rejoin allowed
+      }
+      return; // Abort
+    });
+    
+    if (!result.committed) {
+      throw new Error("NAME_TAKEN");
+    }
+
+    try {
+      // Add as member
+      await set(ref(db, `rooms/${code}/members/${user.uid}`), {
+        name: name,
+        normalizedName: normName,
+        joinedAt: serverTimestamp(),
+      });
+    } catch (e) {
+      // Cleanup if failed
+      if (result.committed) {
+        await set(nameRef, null).catch(console.error);
+      }
+      throw e;
+    }
+  };
+
   const handleCreateChat = async () => {
     if (!user) return;
     setScreen("creating");
@@ -146,11 +180,7 @@ export default function Home() {
         createdAt: serverTimestamp(),
       });
 
-      // Add as member
-      await set(ref(db, `rooms/${code}/members/${user.uid}`), {
-        name: name,
-        joinedAt: serverTimestamp(),
-      });
+      await reserveNameAndJoin(code);
 
       setRoomCode(code);
       setIsCreator(true);
@@ -190,11 +220,16 @@ export default function Home() {
         return;
       }
 
-      // Add as member
-      await set(ref(db, `rooms/${roomCode}/members/${user.uid}`), {
-        name: name,
-        joinedAt: serverTimestamp(),
-      });
+      try {
+        await reserveNameAndJoin(roomCode);
+      } catch (e: any) {
+        if (e.message === "NAME_TAKEN") {
+          setScreen("action"); // Send them back to edit details
+          setGeneralError("This name is already being used in this chat. Please use a different name.");
+          return;
+        }
+        throw e;
+      }
 
       setIsCreator(roomData.creatorId === user.uid);
       joinRoomListeners(roomCode);
@@ -207,13 +242,13 @@ export default function Home() {
   };
 
   const joinRoomListeners = (code: string) => {
-    // Clean up existing listeners
     if (roomStatusUnsub.current) roomStatusUnsub.current();
     if (messagesUnsub.current) messagesUnsub.current();
 
     setMessages([]);
+    setSelectedMessageIds(new Set());
+    setReplyTarget(null);
 
-    // Listen for room status changes
     const statusRef = ref(db, `rooms/${code}/status`);
     roomStatusUnsub.current = onValue(statusRef, (snapshot) => {
       const status = snapshot.val();
@@ -223,7 +258,6 @@ export default function Home() {
       }
     });
 
-    // Listen for messages
     const messagesRef = ref(db, `rooms/${code}/messages`);
     messagesUnsub.current = onValue(messagesRef, (snapshot) => {
       const msgs: Message[] = [];
@@ -242,6 +276,8 @@ export default function Home() {
     if (messagesUnsub.current) messagesUnsub.current();
     setRoomCode("");
     setMessages([]);
+    setSelectedMessageIds(new Set());
+    setReplyTarget(null);
     setScreen("action");
   };
 
@@ -249,26 +285,37 @@ export default function Home() {
     if (!newMessage.trim() || !user || !roomCode) return;
     
     const text = newMessage.trim();
-    setNewMessage(""); // optimistic clear
+    const currentReply = replyTarget;
+    
+    setNewMessage(""); 
+    setReplyTarget(null); // optimistic clear
 
     try {
       const msgRef = push(ref(db, `rooms/${roomCode}/messages`));
-      await set(msgRef, {
+      
+      const messageData: Partial<Message> = {
         senderId: user.uid,
         senderName: name,
         text: text,
-        createdAt: serverTimestamp(),
-      });
+        type: "text",
+        createdAt: serverTimestamp() as unknown as number,
+      };
+
+      if (currentReply) {
+        messageData.replyTo = {
+          messageId: currentReply.id,
+          senderId: currentReply.senderId,
+          senderName: currentReply.senderName,
+          previewText: currentReply.text ? currentReply.text.slice(0, 50) : "Message",
+          type: "text"
+        };
+      }
+
+      await set(msgRef, messageData);
     } catch (error) {
       console.error("Send message error:", error);
-      setNewMessage(text); // revert on error
-    }
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSendMessage();
+      setNewMessage(text);
+      if (currentReply) setReplyTarget(currentReply);
     }
   };
 
@@ -286,12 +333,57 @@ export default function Home() {
         status: "deleted",
         deletedAt: serverTimestamp(),
       });
-      // The status listener will trigger leaveRoom for everyone including creator
       setShowDeleteModal(false);
       setIsDeleting(false);
     } catch (error) {
       console.error("Delete error:", error);
       setIsDeleting(false);
+    }
+  };
+
+  // Interactions
+  const handleSelectToggle = (id: string) => {
+    setSelectedMessageIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const handleCopySelected = async () => {
+    if (selectedMessageIds.size === 0) return;
+    
+    let textToCopy = "";
+    if (selectedMessageIds.size === 1) {
+      const msg = messages.find(m => m.id === Array.from(selectedMessageIds)[0]);
+      if (msg && msg.text) textToCopy = msg.text;
+    } else {
+      const sorted = messages.filter(m => selectedMessageIds.has(m.id)).sort((a, b) => a.createdAt - b.createdAt);
+      textToCopy = sorted.map(m => `${m.senderName}: ${m.text || ""}`).join("\n");
+    }
+
+    if (textToCopy) {
+      try {
+        await navigator.clipboard.writeText(textToCopy);
+        setCopyFeedback(true);
+        setTimeout(() => setCopyFeedback(false), 2000);
+      } catch (err) {
+        console.error("Clipboard error", err);
+      }
+    }
+    setSelectedMessageIds(new Set());
+  };
+
+  const handleCopySingle = async (msg: Message) => {
+    if (msg.text) {
+      try {
+        await navigator.clipboard.writeText(msg.text);
+        setCopyFeedback(true);
+        setTimeout(() => setCopyFeedback(false), 2000);
+      } catch (err) {
+        console.error("Clipboard error", err);
+      }
     }
   };
 
@@ -447,101 +539,75 @@ export default function Home() {
   );
 
   const renderChatScreen = () => (
-    <div className="flex flex-col h-[100dvh] bg-[#EEB2B2]">
-      {/* Header */}
-      <header className="bg-white border-b border-gray-100 py-3 px-4 flex items-center justify-between sticky top-0 z-10 shadow-sm">
-        <div className="flex items-center gap-3">
-           <img 
-            src="/assets/mobchat-logo.png" 
-            alt="MobChat" 
-            className="w-8 h-8 object-contain"
-            onError={(e) => { e.currentTarget.style.display = 'none'; }}
-          />
-          <span className="font-bold text-gray-900 text-lg hidden sm:block">MobChat</span>
+    <div className="flex flex-col h-[100dvh] bg-[#EEB2B2] relative">
+      {copyFeedback && (
+        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-50 bg-black/70 text-white text-sm font-medium px-4 py-2 rounded-full shadow-lg transition-opacity">
+          Copied
         </div>
-        
-        <div className="flex items-center gap-3">
-          <div className="flex flex-col items-end">
-            <span className="text-xs text-gray-500 font-medium">Chat Code</span>
-            <div className="flex items-center gap-1.5 bg-gray-100 pl-3 pr-2 py-1 rounded-md">
-              <span className="font-mono font-bold text-gray-800 tracking-wider text-sm">{roomCode}</span>
-              <button 
-                onClick={handleCopyCode}
-                className="p-1 text-gray-500 hover:text-gray-800 transition-colors"
-                title="Copy Code"
-              >
-                {copied ? <Check className="w-4 h-4 text-green-600" /> : <Copy className="w-4 h-4" />}
-              </button>
-            </div>
+      )}
+
+      {selectedMessageIds.size > 0 ? (
+        <SelectionActionBar 
+          selectedCount={selectedMessageIds.size} 
+          onClose={() => setSelectedMessageIds(new Set())}
+          onCopy={handleCopySelected}
+        />
+      ) : (
+        <header className="bg-white border-b border-gray-100 py-3 px-4 flex items-center justify-between sticky top-0 z-10 shadow-sm">
+          <div className="flex items-center gap-3">
+             <img 
+              src="/assets/mobchat-logo.png" 
+              alt="MobChat" 
+              className="w-8 h-8 object-contain"
+              onError={(e) => { e.currentTarget.style.display = 'none'; }}
+            />
+            <span className="font-bold text-gray-900 text-lg hidden sm:block">MobChat</span>
           </div>
           
-          {isCreator && (
-            <button
-              onClick={() => setShowDeleteModal(true)}
-              className="p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-full transition-colors ml-2"
-              title="Delete Chat"
-            >
-              <Trash2 className="w-5 h-5" />
-            </button>
-          )}
-        </div>
-      </header>
-
-      {/* Messages Area */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {messages.length === 0 ? (
-          <div className="h-full flex items-center justify-center text-gray-600 text-sm font-medium">
-            No messages yet. Start the conversation.
-          </div>
-        ) : (
-          messages.map((msg) => {
-            const isMine = msg.senderId === user?.uid;
-
-            return (
-              <div key={msg.id} className={`flex flex-col ${isMine ? "items-end" : "items-start"}`}>
-                {!isMine && (
-                  <span className="text-xs text-gray-500 font-medium ml-1 mb-1">{msg.senderName}</span>
-                )}
-                <div 
-                  className={`max-w-[85%] sm:max-w-[70%] px-4 py-2.5 rounded-2xl shadow-sm text-sm ${
-                    isMine 
-                      ? "bg-[#D48989] text-gray-900 rounded-tr-sm" 
-                      : "bg-white text-gray-800 border border-gray-100 rounded-tl-sm"
-                  }`}
-                  style={{ wordBreak: 'break-word' }}
+          <div className="flex items-center gap-3">
+            <div className="flex flex-col items-end">
+              <span className="text-xs text-gray-500 font-medium">Chat Code</span>
+              <div className="flex items-center gap-1.5 bg-gray-100 pl-3 pr-2 py-1 rounded-md">
+                <span className="font-mono font-bold text-gray-800 tracking-wider text-sm">{roomCode}</span>
+                <button 
+                  onClick={handleCopyCode}
+                  className="p-1 text-gray-500 hover:text-gray-800 transition-colors"
+                  title="Copy Code"
                 >
-                  <p className="whitespace-pre-wrap">{msg.text}</p>
-                </div>
-                <span className="text-[10px] text-gray-400 mt-1 mx-1">
-                  {msg.createdAt ? new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ""}
-                </span>
+                  {copied ? <Check className="w-4 h-4 text-green-600" /> : <Copy className="w-4 h-4" />}
+                </button>
               </div>
-            );
-          })
-        )}
-        <div ref={messagesEndRef} />
-      </div>
+            </div>
+            
+            {isCreator && (
+              <button
+                onClick={() => setShowDeleteModal(true)}
+                className="p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-full transition-colors ml-2"
+                title="Delete Chat"
+              >
+                <Trash2 className="w-5 h-5" />
+              </button>
+            )}
+          </div>
+        </header>
+      )}
 
-      {/* Composer */}
-      <div className="bg-white border-t border-gray-200 p-3 sm:p-4 pb-safe sticky bottom-0">
-        <div className="flex items-end gap-2 max-w-4xl mx-auto">
-          <textarea
-            value={newMessage}
-            onChange={(e) => setNewMessage(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Type a message..."
-            className="flex-1 max-h-32 min-h-[44px] bg-gray-50 text-gray-900 border border-gray-200 rounded-2xl px-4 py-3 focus:outline-none focus:ring-1 focus:ring-[#EEB2B2] resize-none text-sm"
-            rows={1}
-          />
-          <button
-            onClick={handleSendMessage}
-            disabled={!newMessage.trim()}
-            className="bg-[#EEB2B2] text-gray-900 p-3 rounded-full hover:bg-[#D48989] transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0 mb-0.5"
-          >
-            <Send className="w-5 h-5" />
-          </button>
-        </div>
-      </div>
+      <MessageList 
+        messages={messages}
+        currentUserId={user?.uid}
+        selectedIds={selectedMessageIds}
+        onSelectToggle={handleSelectToggle}
+        onReply={(msg) => setReplyTarget(msg)}
+        onCopy={handleCopySingle}
+      />
+
+      <Composer 
+        newMessage={newMessage}
+        setNewMessage={setNewMessage}
+        onSendMessage={handleSendMessage}
+        replyTarget={replyTarget}
+        onCancelReply={() => setReplyTarget(null)}
+      />
 
       {/* Delete Modal */}
       {showDeleteModal && (
