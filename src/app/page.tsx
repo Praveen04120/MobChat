@@ -337,8 +337,15 @@ export default function Home() {
         finalMediaUrl = newBlob.url;
         setUploadedBlobUrl(newBlob.url);
       } catch (err: any) {
+        console.error("Vercel Blob Upload failed:", err, {
+           name: err?.name,
+           message: err?.message,
+           fileType: selectedFile.type,
+           fileSize: selectedFile.size,
+           fileName: selectedFile.name
+        });
         setIsUploading(false);
-        setUploadError("Upload failed. Please try again.");
+        setUploadError(`Upload failed: ${err?.message || "Unknown error"}. Please try again.`);
         return; // Don't proceed to Firebase write
       }
     }
@@ -407,10 +414,13 @@ export default function Home() {
       setSelectedFile(null);
       setUploadedBlobUrl("");
       setIsUploading(false);
-    } catch (error) {
-      console.error("Send message error:", error);
+    } catch (error: any) {
+      console.error("Firebase send message error:", error, {
+        name: error?.name,
+        message: error?.message
+      });
       setIsUploading(false);
-      setUploadError("Failed to send message. Click send to retry.");
+      setUploadError("File uploaded, but the message could not be sent. Please try again.");
       setNewMessage(text);
       if (currentReply) setReplyTarget(currentReply);
     }
