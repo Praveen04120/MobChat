@@ -173,14 +173,27 @@ export default function Home() {
         exists = snapshot.exists();
       }
 
+      const normName = normalizeName(name);
+      const safeKey = createFirebaseSafeNameKey(normName);
+
+      // We perform a SINGLE atomic set() for the entire room.
+      // Since the room doesn't exist, this passes the !data.exists() rule check.
       const roomRef = ref(db, `rooms/${code}`);
       await set(roomRef, {
         creatorId: user.uid,
         status: "active",
         createdAt: serverTimestamp(),
+        members: {
+          [user.uid]: {
+            name: name,
+            normalizedName: normName,
+            joinedAt: serverTimestamp(),
+          }
+        },
+        memberNames: {
+          [safeKey]: user.uid
+        }
       });
-
-      await reserveNameAndJoin(code);
 
       setRoomCode(code);
       setIsCreator(true);
