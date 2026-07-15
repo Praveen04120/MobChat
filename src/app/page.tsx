@@ -12,7 +12,8 @@ import { Message } from "@/components/chat/types";
 import { MessageList } from "@/components/chat/MessageList";
 import { Composer } from "@/components/chat/Composer";
 import { SelectionActionBar } from "@/components/chat/SelectionActionBar";
-import { normalizeName, createFirebaseSafeNameKey } from "@/lib/utils";
+import { normalizeName, createFirebaseSafeNameKey, getMediaType, validateFileSize } from "@/lib/utils";
+import { upload } from "@vercel/blob/client";
 
 type Screen = "loading" | "welcome" | "action" | "join" | "creating" | "chat";
 
@@ -47,6 +48,12 @@ export default function Home() {
   // Advanced Chat State
   const [selectedMessageIds, setSelectedMessageIds] = useState<Set<string>>(new Set());
   const [replyTarget, setReplyTarget] = useState<Message | null>(null);
+
+  // Media State
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadError, setUploadError] = useState("");
+  const [uploadedBlobUrl, setUploadedBlobUrl] = useState("");
 
   // Subscriptions refs to clean up
   const roomStatusUnsub = useRef<Unsubscribe | null>(null);
@@ -291,17 +298,74 @@ export default function Home() {
     setMessages([]);
     setSelectedMessageIds(new Set());
     setReplyTarget(null);
+    setSelectedFile(null);
+    setUploadError("");
+    setUploadedBlobUrl("");
     setScreen("action");
   };
 
   const handleSendMessage = async () => {
-    if (!newMessage.trim() || !user || !roomCode) return;
+    if (!user || !roomCode) return;
+    if (!newMessage.trim() && !selectedFile && !uploadedBlobUrl) return;
     
+    let finalMediaUrl = uploadedBlobUrl;
+    let finalFileName = "";
+    let finalMimeType = "";
+    let finalFileSize = 0;
+    let finalType: Message["type"] = "text";
+
+    if (selectedFile && !finalMediaUrl) {
+      const validation = validateFileSize(selectedFile);
+      if (!validation.valid) {
+        setUploadError(validation.error!);
+        return;
+      }
+
+      setIsUploading(true);
+      setUploadError("");
+      try {
+        const type = getMediaType(selectedFile);
+        // We use a room-scoped prefix for cleanup later: rooms/ROOMCODE/...
+        const filename = `rooms/${roomCode}/${Date.now()}_${selectedFile.name.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
+        
+        const newBlob = await upload(filename, selectedFile, {
+          access: 'public',
+          handleUploadUrl: '/api/upload',
+          clientPayload: JSON.stringify({ type })
+        });
+        
+        finalMediaUrl = newBlob.url;
+        setUploadedBlobUrl(newBlob.url);
+      } catch (err: any) {
+        setIsUploading(false);
+        setUploadError("Upload failed. Please try again.");
+        return; // Don't proceed to Firebase write
+      }
+    }
+
+    if (selectedFile || finalMediaUrl) {
+      // If we had a file (either just uploaded or previously uploaded)
+      const fileToUse = selectedFile; // We need metadata. If it was retried, selectedFile is still there.
+      if (fileToUse) {
+        finalType = getMediaType(fileToUse);
+        finalFileName = fileToUse.name;
+        finalMimeType = fileToUse.type;
+        finalFileSize = fileToUse.size;
+      } else {
+        // Fallback if somehow file is missing but URL exists
+        finalType = "file";
+      }
+    }
+
     const text = newMessage.trim();
     const currentReply = replyTarget;
+    const currentFile = selectedFile;
     
+    // Optimistic UI clear for text/reply, keep file visually in case Firebase fails
     setNewMessage(""); 
-    setReplyTarget(null); // optimistic clear
+    setReplyTarget(null);
+    setUploadError("");
+    setIsUploading(true); // Keep spinner during Firebase write
 
     try {
       const msgRef = push(ref(db, `rooms/${roomCode}/messages`));
@@ -310,23 +374,43 @@ export default function Home() {
         senderId: user.uid,
         senderName: name,
         text: text,
-        type: "text",
+        type: finalType,
         createdAt: serverTimestamp() as unknown as number,
       };
 
+      if (finalMediaUrl) {
+        messageData.mediaUrl = finalMediaUrl;
+        messageData.fileName = finalFileName;
+        messageData.mimeType = finalMimeType;
+        messageData.fileSize = finalFileSize;
+      }
+
       if (currentReply) {
+        let preview = "Message";
+        if (currentReply.type === 'image') preview = "📷 Photo";
+        else if (currentReply.type === 'video') preview = "🎥 Video";
+        else if (currentReply.type === 'file') preview = `📄 ${currentReply.fileName || 'Document'}`;
+        else if (currentReply.text) preview = currentReply.text.slice(0, 50);
+
         messageData.replyTo = {
           messageId: currentReply.id,
           senderId: currentReply.senderId,
           senderName: currentReply.senderName,
-          previewText: currentReply.text ? currentReply.text.slice(0, 50) : "Message",
-          type: "text"
+          previewText: preview,
+          type: currentReply.type || "text"
         };
       }
 
       await set(msgRef, messageData);
+      
+      // Full clear on ultimate success
+      setSelectedFile(null);
+      setUploadedBlobUrl("");
+      setIsUploading(false);
     } catch (error) {
       console.error("Send message error:", error);
+      setIsUploading(false);
+      setUploadError("Failed to send message. Click send to retry.");
       setNewMessage(text);
       if (currentReply) setReplyTarget(currentReply);
     }
@@ -342,14 +426,27 @@ export default function Home() {
     if (!isCreator || !roomCode) return;
     setIsDeleting(true);
     try {
+      // Clean up blobs
+      try {
+        await fetch('/api/upload/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ roomCode }),
+        });
+      } catch (err) {
+        console.error("Blob cleanup failed:", err);
+      }
+
       await update(ref(db, `rooms/${roomCode}`), {
         status: "deleted",
         deletedAt: serverTimestamp(),
       });
       setShowDeleteModal(false);
       setIsDeleting(false);
+      setScreen("action");
+      setRoomCode("");
     } catch (error) {
-      console.error("Delete error:", error);
+      console.error("Delete room error:", error);
       setIsDeleting(false);
     }
   };
@@ -364,16 +461,34 @@ export default function Home() {
     });
   };
 
+  const getMessageCopyText = (msg: Message, includeSender: boolean = false): string => {
+    let prefix = includeSender ? `${msg.senderName}: ` : "";
+    let content = "";
+
+    if (msg.type === "image") {
+      content = msg.text ? `[Photo] ${msg.text}` : "[Photo]";
+    } else if (msg.type === "video") {
+      content = msg.text ? `[Video] ${msg.text}` : "[Video]";
+    } else if (msg.type === "file") {
+      const fn = msg.fileName || "file";
+      content = msg.text ? `[File: ${fn}] ${msg.text}` : `[File: ${fn}]`;
+    } else {
+      content = msg.text || "";
+    }
+
+    return `${prefix}${content}`;
+  };
+
   const handleCopySelected = async () => {
     if (selectedMessageIds.size === 0) return;
     
     let textToCopy = "";
     if (selectedMessageIds.size === 1) {
       const msg = messages.find(m => m.id === Array.from(selectedMessageIds)[0]);
-      if (msg && msg.text) textToCopy = msg.text;
+      if (msg) textToCopy = getMessageCopyText(msg, false);
     } else {
       const sorted = messages.filter(m => selectedMessageIds.has(m.id)).sort((a, b) => a.createdAt - b.createdAt);
-      textToCopy = sorted.map(m => `${m.senderName}: ${m.text || ""}`).join("\n");
+      textToCopy = sorted.map(m => getMessageCopyText(m, true)).join("\n");
     }
 
     if (textToCopy) {
@@ -389,9 +504,10 @@ export default function Home() {
   };
 
   const handleCopySingle = async (msg: Message) => {
-    if (msg.text) {
+    const textToCopy = getMessageCopyText(msg, false);
+    if (textToCopy) {
       try {
-        await navigator.clipboard.writeText(msg.text);
+        await navigator.clipboard.writeText(textToCopy);
         setCopyFeedback(true);
         setTimeout(() => setCopyFeedback(false), 2000);
       } catch (err) {
@@ -614,13 +730,22 @@ export default function Home() {
         onCopy={handleCopySingle}
       />
 
-      <Composer 
-        newMessage={newMessage}
-        setNewMessage={setNewMessage}
-        onSendMessage={handleSendMessage}
-        replyTarget={replyTarget}
-        onCancelReply={() => setReplyTarget(null)}
-      />
+        <Composer 
+          newMessage={newMessage}
+          setNewMessage={setNewMessage}
+          onSendMessage={handleSendMessage}
+          replyTarget={replyTarget}
+          onCancelReply={() => setReplyTarget(null)}
+          selectedFile={selectedFile}
+          setSelectedFile={(file) => {
+            setSelectedFile(file);
+            setUploadError("");
+            setUploadedBlobUrl(""); // clear uploaded URL if file changes
+          }}
+          isUploading={isUploading}
+          uploadError={uploadError}
+          uploadedBlobUrl={uploadedBlobUrl}
+        />
 
       {/* Delete Modal */}
       {showDeleteModal && (

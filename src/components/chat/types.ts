@@ -4,12 +4,16 @@ export interface Message {
   senderName: string;
   text?: string;
   createdAt: number;
-  type?: "text"; // Future expansion for media
+  type?: "text" | "image" | "video" | "file";
+  mediaUrl?: string;
+  fileName?: string;
+  mimeType?: string;
+  fileSize?: number;
   replyTo?: {
     messageId: string;
     senderId: string;
     senderName: string;
     previewText: string;
-    type: "text";
+    type: "text" | "image" | "video" | "file";
   };
 }
